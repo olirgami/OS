@@ -1,0 +1,346 @@
+Хорошо, я разобью код на **логические блоки** и объясню его **почти построчно** — так, чтобы было понятно даже новичку.
+
+---
+
+## Блок 0: Заголовочные файлы (самое начало)
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include "threadpool.h"
+```
+
+| Файл | Зачем |
+|------|-------|
+| `stdio.h` | Для `printf`, `NULL` |
+| `stdlib.h` | Для `malloc`, `free` |
+| `pthread.h` | Для работы с потоками: `pthread_create`, `pthread_join` |
+| `semaphore.h` | Для семафоров: `sem_init`, `sem_wait`, `sem_post`, `sem_destroy` |
+| `threadpool.h` | Наш заголовочный файл (там прототипы функций, которые мы реализуем) |
+
+---
+
+## Блок 1: Определение структуры задачи
+
+```c
+typedef struct task {
+    void (*function)(void *);   // указатель на функцию
+    void *arg;                  // аргумент для этой функции
+} Task;
+```
+
+| Строка | Объяснение |
+|--------|------------|
+| `typedef struct task { ... } Task;` | Создаём новый тип данных `Task` |
+| `void (*function)(void *);` | Это указатель на функцию, которая принимает `void*` и ничего не возвращает |
+| `void *arg;` | Аргумент, который будет передан в эту функцию |
+
+**Зачем:** Каждая задача — это «что выполнить» (функция) и «с какими данными».
+
+---
+
+## Блок 2: Структура очереди (связный список)
+
+```c
+typedef struct node {
+    Task *task;          // указатель на задачу
+    struct node *next;   // указатель на следующий узел
+} node_t;
+```
+
+| Строка | Объяснение |
+|--------|------------|
+| `typedef struct node { ... } node_t;` | Создаём тип `node_t` — узел очереди |
+| `Task *task;` | В каждом узле лежит указатель на задачу |
+| `struct node *next;` | Указатель на следующий узел (чтобы строить список) |
+
+```c
+static node_t *head = NULL;
+static node_t *tail = NULL;
+```
+
+| Переменная | Зачем |
+|------------|-------|
+| `head` | Указывает на **первый** узел очереди (отсюда забираем задачи) |
+| `tail` | Указывает на **последний** узел очереди (сюда добавляем новые задачи) |
+| `static` | Переменные видны только внутри этого файла |
+
+---
+
+## Блок 3: Глобальные переменные синхронизации и состояния
+
+```c
+static pthread_t *workers = NULL;
+static int num_workers = 0;
+static int shutdown_flag = 0;
+static int tasks_count = 0;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static sem_t sem;
+```
+
+| Переменная | Зачем |
+|------------|-------|
+| `workers` | Массив идентификаторов потоков (их создаём в `pool_init`) |
+| `num_workers` | Сколько потоков в пуле |
+| `shutdown_flag` | Флаг: пора ли выключаться (ставим в `pool_shutdown`) |
+| `tasks_count` | Счётчик задач в очереди (не обязателен, но полезен) |
+| `mutex` | Защищает очередь от одновременного доступа |
+| `sem` | Семафор — сколько задач сейчас в очереди (с учётом уже взятых) |
+
+`PTHREAD_MUTEX_INITIALIZER` — специальная константа для инициализации мьютекса.
+
+---
+
+## Блок 4: Функция `enqueue` (добавить задачу в очередь)
+
+```c
+void enqueue(Task *task) {
+    node_t *new_node = malloc(sizeof(node_t));
+    new_node->task = task;
+    new_node->next = NULL;
+
+    if (tail == NULL) {
+        head = tail = new_node;
+    } else {
+        tail->next = new_node;
+        tail = new_node;
+    }
+    tasks_count++;
+}
+```
+
+| Строка | Объяснение |
+|--------|------------|
+| `node_t *new_node = malloc(sizeof(node_t));` | Выделяем память под новый узел |
+| `new_node->task = task;` | Кладём в узел задачу |
+| `new_node->next = NULL;` | Пока это последний узел, его `next` указывает в никуда |
+| `if (tail == NULL)` | Если очередь пуста (`tail` == NULL) |
+| `head = tail = new_node;` | Новый узел становится и головой, и хвостом |
+| `else` | Если очередь не пуста |
+| `tail->next = new_node;` | Цепляем новый узел после текущего хвоста |
+| `tail = new_node;` | Сдвигаем хвост на новый узел |
+| `tasks_count++;` | Увеличиваем счётчик задач |
+
+---
+
+## Блок 5: Функция `dequeue` (взять задачу из очереди)
+
+```c
+Task *dequeue() {
+    if (head == NULL) return NULL;
+
+    node_t *temp = head;
+    Task *task = head->task;
+    head = head->next;
+
+    if (head == NULL) tail = NULL;
+
+    free(temp);
+    tasks_count--;
+    return task;
+}
+```
+
+| Строка | Объяснение |
+|--------|------------|
+| `if (head == NULL) return NULL;` | Если очередь пуста — возвращаем `NULL` |
+| `node_t *temp = head;` | Запоминаем старую голову |
+| `Task *task = head->task;` | Забираем задачу из головы |
+| `head = head->next;` | Сдвигаем голову на следующий узел |
+| `if (head == NULL) tail = NULL;` | Если очередь стала пуста, обнуляем и хвост |
+| `free(temp);` | Удаляем старый узел |
+| `tasks_count--;` | Уменьшаем счётчик задач |
+| `return task;` | Возвращаем задачу (или `NULL`) |
+
+---
+
+## Блок 6: Функция `worker` (рабочий поток)
+
+```c
+void *worker(void *arg) {
+    (void)arg;
+
+    while (1) {
+        sem_wait(&sem);
+
+        pthread_mutex_lock(&mutex);
+
+        if (shutdown_flag && head == NULL) {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+
+        Task *task = dequeue();
+        pthread_mutex_unlock(&mutex);
+
+        if (task != NULL) {
+            task->function(task->arg);
+            free(task);
+        }
+    }
+    return NULL;
+}
+```
+
+| Строка | Объяснение |
+|--------|------------|
+| `(void)arg;` | Подавляем предупреждение компилятора |
+| `while (1)` | Бесконечный цикл |
+| `sem_wait(&sem);` | Уменьшаем семафор. Если он был 0 — засыпаем |
+| `pthread_mutex_lock(&mutex);` | Захватываем мьютекс (доступ к очереди) |
+| `if (shutdown_flag && head == NULL)` | Если пора выходить **и** очередь пуста |
+| `pthread_mutex_unlock(&mutex); break;` | Отпускаем мьютекс и выходим из цикла |
+| `Task *task = dequeue();` | Забираем задачу из очереди |
+| `pthread_mutex_unlock(&mutex);` | Отпускаем мьютекс |
+| `if (task != NULL)` | Если задачу получили |
+| `task->function(task->arg);` | Выполняем её (вызываем функцию с аргументом) |
+| `free(task);` | Освобождаем память задачи |
+| `return NULL;` | Когда вышли из цикла — завершаем поток |
+
+---
+
+## Блок 7: Инициализация пула `pool_init`
+
+```c
+int pool_init(int num_threads) {
+    num_workers = num_threads;
+    shutdown_flag = 0;
+    tasks_count = 0;
+    head = tail = NULL;
+
+    sem_init(&sem, 0, 0);
+
+    workers = malloc(num_workers * sizeof(pthread_t));
+    if (workers == NULL) return -1;
+
+    for (int i = 0; i < num_workers; i++) {
+        if (pthread_create(&workers[i], NULL, worker, NULL) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+```
+
+| Строка | Объяснение |
+|--------|------------|
+| `num_workers = num_threads;` | Запоминаем, сколько потоков создавать |
+| `shutdown_flag = 0;` | Флаг выключения пока не установлен |
+| `head = tail = NULL;` | Очередь пуста |
+| `sem_init(&sem, 0, 0);` | Семафор инициализируем нулём (нет задач, потоки будут спать) |
+| `workers = malloc(...);` | Выделяем память под массив потоков |
+| `if (workers == NULL) return -1;` | Если память не выделилась — ошибка |
+| `pthread_create(...)` | Создаём поток, он сразу входит в `worker` и засыпает на `sem_wait` |
+| `return 0;` | Успех |
+
+---
+
+## Блок 8: Отправка задачи `pool_submit`
+
+```c
+int pool_submit(void (*function)(void *), void *arg) {
+    Task *task = (Task *)malloc(sizeof(Task));
+    if (task == NULL) return 1;
+
+    task->function = function;
+    task->arg = arg;
+
+    pthread_mutex_lock(&mutex);
+    enqueue(task);
+    pthread_mutex_unlock(&mutex);
+
+    sem_post(&sem);
+
+    return 0;
+}
+```
+
+| Строка | Объяснение |
+|--------|------------|
+| `Task *task = malloc(sizeof(Task));` | Создаём задачу в куче |
+| `if (task == NULL) return 1;` | Ошибка памяти |
+| `task->function = function;` | Запоминаем, какую функцию выполнять |
+| `task->arg = arg;` | Запоминаем аргумент |
+| `pthread_mutex_lock(&mutex);` | Блокируем очередь |
+| `enqueue(task);` | Добавляем задачу в конец очереди |
+| `pthread_mutex_unlock(&mutex);` | Отпускаем очередь |
+| `sem_post(&sem);` | Увеличиваем семафор → будим один спящий поток |
+| `return 0;` | Успех |
+
+---
+
+## Блок 9: Завершение пула `pool_shutdown`
+
+```c
+void pool_shutdown(void) {
+    pthread_mutex_lock(&mutex);
+    shutdown_flag = 1;
+    pthread_mutex_unlock(&mutex);
+
+    for (int i = 0; i < num_workers; i++) {
+        sem_post(&sem);
+    }
+
+    for (int i = 0; i < num_workers; i++) {
+        pthread_join(workers[i], NULL);
+    }
+
+    free(workers);
+    sem_destroy(&sem);
+    pthread_mutex_destroy(&mutex);
+
+    while (head != NULL) {
+        node_t *temp = head;
+        head = head->next;
+        free(temp->task);
+        free(temp);
+    }
+    tail = NULL;
+    tasks_count = 0;
+}
+```
+
+| Строка | Объяснение |
+|--------|------------|
+| `pthread_mutex_lock(&mutex);` | Блокируем очередь |
+| `shutdown_flag = 1;` | Устанавливаем флаг «пора выходить» |
+| `pthread_mutex_unlock(&mutex);` | Отпускаем очередь |
+| `for (...) sem_post(&sem);` | Будим **все** потоки (чтобы они проверили флаг) |
+| `for (...) pthread_join(...);` | Ждём завершения всех потоков |
+| `free(workers);` | Освобождаем память массива потоков |
+| `sem_destroy(&sem);` | Уничтожаем семафор |
+| `pthread_mutex_destroy(&mutex);` | Уничтожаем мьютекс |
+| `while (head != NULL) { ... }` | Очищаем очередь от оставшихся задач |
+| `tail = NULL; tasks_count = 0;` | Обнуляем указатели и счётчик |
+
+---
+
+## Итоговая схема работы
+
+```
+main() вызывает pool_init(4)
+    ↓
+создаются 4 потока, каждый засыпает на sem_wait (sem = 0)
+    ↓
+main() вызывает pool_submit для 10 задач
+    ↓
+каждая задача помещается в очередь под мьютексом
+    ↓
+sem_post(&sem) увеличивает семафор и будит один поток
+    ↓
+поток просыпается, забирает задачу под мьютексом, выполняет её
+    ↓
+поток возвращается к sem_wait (или берёт следующую задачу, если задач ещё много)
+    ↓
+после 10 задач очередь пуста, потоки снова засыпают
+    ↓
+main() вызывает pool_shutdown
+    ↓
+устанавливается shutdown_flag, будятся все потоки
+    ↓
+они видят флаг и пустую очередь, выходят из цикла и завершаются
+    ↓
+pool_shutdown ждёт их через pthread_join и чистит память
+```
